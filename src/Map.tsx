@@ -1,21 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Map, { Layer, Source } from 'react-map-gl/maplibre'
 import type {
+  CircleLayerSpecification,
   DataDrivenPropertyValueSpecification,
   ExpressionSpecification,
   FillLayerSpecification,
+  FilterSpecification,
   LineLayerSpecification,
   Map as MapLibreMap,
   MapLayerMouseEvent,
   MapLibreEvent,
   ResolvedImageSpecification,
   StyleSpecification,
+  SymbolLayerSpecification,
 } from 'maplibre-gl'
 import * as topojson from 'topojson-client'
 import type { FeatureCollection, Geometry } from 'geojson'
 import { fetchMapData } from './data/mapData'
 import DistanceHistogram from './DistanceHistogram'
 import HopDistanceBar, { HopDistanceInstructions } from './HopDistanceBar'
+import RoutePlanner from './RoutePlanner'
+import { buildPath, computeHopDistances } from './graph'
+import { MAX_CASES, planRoute, type PickMode, type Route } from './route'
 
 
 // No raster/vector tile basemap: the game ships its own world landmass and
@@ -57,12 +63,82 @@ const dotsImageId = (index: number) => `dots-${index}`
 // regions source has ~181k vertices, so dropping one is worth a 1px image.
 const DOTS_BLANK_ID = 'dots-blank'
 
+// Crate gold, home blue and a green for where the player stands, shared by the
+// route line, its markers and the region outlines so a colour means the same
+// thing wherever it shows up.
+const ROUTE_CASE_COLOR = '#f1c40f'
+const ROUTE_HOME_COLOR = '#4a90d9'
+const ROUTE_PLAYER_COLOR = '#2ecc71'
+
 // Depends on nothing, so it is hoisted: a fresh object here would make
-// react-map-gl deep-compare it on every render.
+// react-map-gl deep-compare it on every render. Same for every route paint
+// below, which is why the roles ride in the data rather than in the props.
 const HIGHLIGHT_PAINT = {
-  'line-color': '#ffffff',
+  'line-color': [
+    'match',
+    ['get', 'role'],
+    'home', ROUTE_HOME_COLOR,
+    'case', ROUTE_CASE_COLOR,
+    'player', ROUTE_PLAYER_COLOR,
+    '#ffffff',
+  ],
   'line-width': ['case', ['==', ['get', 'role'], 'start'], 2.5, 1.8],
 } as LineLayerSpecification['paint']
+
+const WALKED_LEG_FILTER = ['==', ['get', 'kind'], 'walk'] as FilterSpecification
+const HOME_LEG_FILTER = ['==', ['get', 'kind'], 'home'] as FilterSpecification
+
+const ROUTE_LINE_LAYOUT = {
+  'line-cap': 'round',
+  'line-join': 'round',
+} as LineLayerSpecification['layout']
+
+const ROUTE_GLOW_PAINT = {
+  'line-color': ROUTE_CASE_COLOR,
+  'line-width': 9,
+  'line-blur': 4,
+  'line-opacity': 0.3,
+} as LineLayerSpecification['paint']
+
+const ROUTE_CORE_PAINT = {
+  'line-color': ROUTE_CASE_COLOR,
+  'line-width': 2.5,
+  'line-opacity': 0.95,
+} as LineLayerSpecification['paint']
+
+// The free trip home is not walked, so it is drawn as a dashed shortcut
+// straight back rather than as a path through the regions in between.
+const ROUTE_HOME_LEG_PAINT = {
+  'line-color': ROUTE_HOME_COLOR,
+  'line-width': 1.6,
+  'line-dasharray': [3, 2],
+  'line-opacity': 0.85,
+} as LineLayerSpecification['paint']
+
+const ROUTE_MARKER_PAINT = {
+  'circle-radius': 9,
+  'circle-color': [
+    'match',
+    ['get', 'role'],
+    'home', ROUTE_HOME_COLOR,
+    'player', ROUTE_PLAYER_COLOR,
+    ROUTE_CASE_COLOR,
+  ],
+  'circle-stroke-color': '#0b1c33',
+  'circle-stroke-width': 1.5,
+} as CircleLayerSpecification['paint']
+
+// allow-overlap: two crates in neighbouring regions would otherwise drop one
+// of the collection numbers, which is the one thing the marker is there for.
+const ROUTE_MARKER_LAYOUT = {
+  'text-field': ['get', 'label'],
+  'text-size': 11,
+  'text-font': ['Noto Sans Regular'],
+  'text-allow-overlap': true,
+  'text-ignore-placement': true,
+} as SymbolLayerSpecification['layout']
+
+const ROUTE_MARKER_LABEL_PAINT = { 'text-color': '#0b1c33' } as SymbolLayerSpecification['paint']
 
 // Two dots per tile on opposite quarter-points, which lays them out as a
 // diagonal lattice rather than a square grid. Each dot is stamped at every
@@ -145,44 +221,6 @@ interface MapLayers {
   regionLabels: FeatureCollection<Geometry, { regionId: string; name: string; textColor: string; strokeColor: string }>
 }
 
-// Unweighted, undirected adjacency graph -> plain BFS gives the shortest
-// hop count ("travels") from sourceId to every reachable region, plus a
-// predecessor map so the actual shortest path can be reconstructed later.
-function computeHopDistances(sourceId: string, adjacency: globalThis.Map<string, string[]>) {
-  const distances = new globalThis.Map<string, number>([[sourceId, 0]])
-  const predecessors = new globalThis.Map<string, string>()
-  const queue = [sourceId]
-  let head = 0
-  while (head < queue.length) {
-    const current = queue[head++]
-    const currentDistance = distances.get(current)!
-    for (const neighborId of adjacency.get(current) ?? []) {
-      if (!distances.has(neighborId)) {
-        distances.set(neighborId, currentDistance + 1)
-        predecessors.set(neighborId, current)
-        queue.push(neighborId)
-      }
-    }
-  }
-  return { distances, predecessors }
-}
-
-function buildPath(
-  sourceId: string,
-  targetId: string,
-  predecessors: globalThis.Map<string, string>,
-): string[] {
-  const path = [targetId]
-  let current = targetId
-  while (current !== sourceId) {
-    const previous = predecessors.get(current)
-    if (!previous) return [] // unreachable
-    path.push(previous)
-    current = previous
-  }
-  return path.reverse()
-}
-
 // countryLabels/regionLabels store already-real lon/lat in `coordinates`
 // (verified against each country's own polygon centroid), unlike every other
 // object in this topology, whose coordinates are quantized and need the
@@ -222,6 +260,34 @@ function writeRegionToUrl(regionId: string | null, { replace = false } = {}) {
   else window.history.pushState(null, '', url)
 }
 
+// The home region is a property of the player rather than of the link, so it
+// outlives the query string: a cookie brings it back on any later visit,
+// including one through a shared ?region= url that carries someone else's
+// selection. The crates themselves are not stored -- they move every hour.
+const HOME_COOKIE = 'warera-home-region'
+const HOME_COOKIE_MAX_AGE = 60 * 60 * 24 * 365
+
+function readHomeFromCookie() {
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${HOME_COOKIE}=([^;]*)`))
+  return match ? decodeURIComponent(match[1]) : null
+}
+
+function writeHomeToCookie(regionId: string | null) {
+  const value = regionId ? encodeURIComponent(regionId) : ''
+  const maxAge = regionId ? HOME_COOKIE_MAX_AGE : 0
+  document.cookie = `${HOME_COOKIE}=${value}; path=/; max-age=${maxAge}; samesite=lax`
+}
+
+// A planned route kept with the inputs it was planned for, so a changed
+// position, home or crate list invalidates it during render rather than
+// through an effect.
+interface PlannedRoute {
+  playerId: string
+  homeId: string | null
+  caseIds: string[]
+  route: Route
+}
+
 // Touch devices have no hover, so there is no way to point at a destination
 // without committing to it. `(hover: hover)` is the primary-pointer test the
 // CSS spec defines for exactly this, and it is watched rather than read once so
@@ -246,6 +312,13 @@ function BaseMap() {
   const [tappedTargetId, setTappedTargetId] = useState<string | null>(null)
   const canHover = useCanHover()
   const [dotsReady, setDotsReady] = useState(false)
+  const [requestedHomeId, setRequestedHomeId] = useState<string | null>(readHomeFromCookie)
+  // Where the player stands right now. Not persisted: it changes with every
+  // trip, unlike home.
+  const [playerId, setPlayerId] = useState<string | null>(null)
+  const [caseIds, setCaseIds] = useState<string[]>([])
+  const [picking, setPicking] = useState<PickMode>(null)
+  const [plan, setPlan] = useState<PlannedRoute | null>(null)
 
   const handleLoad = useCallback((event: MapLibreEvent) => {
     registerDotsImages(event.target)
@@ -318,6 +391,36 @@ function BaseMap() {
     writeRegionToUrl(null, { replace: true })
   }, [layers, requestedRegionId, adjacency])
 
+  // Same treatment as ?region=: a cookie written before a map update can name
+  // a region that no longer exists, which would plan every route from a
+  // phantom node, so it is dropped rather than used.
+  const homeId =
+    requestedHomeId && layers && !adjacency.has(requestedHomeId) ? null : requestedHomeId
+
+  useEffect(() => {
+    if (!layers || !requestedHomeId || adjacency.has(requestedHomeId)) return
+    console.warn('Unknown home region in cookie, ignoring:', requestedHomeId)
+    writeHomeToCookie(null)
+  }, [layers, requestedHomeId, adjacency])
+
+  // A route only describes the position, home and crates it was planned for,
+  // so it is kept alongside them and read back only while all three match.
+  const route =
+    plan && plan.playerId === playerId && plan.homeId === homeId && plan.caseIds === caseIds
+      ? plan.route
+      : null
+
+  // Arming a pick takes over the next map click, so there has to be a way out
+  // that does not commit to a region.
+  useEffect(() => {
+    if (!picking) return
+    const cancel = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPicking(null)
+    }
+    window.addEventListener('keydown', cancel)
+    return () => window.removeEventListener('keydown', cancel)
+  }, [picking])
+
   const positionById = useMemo(() => {
     const map = new globalThis.Map<string, [number, number]>()
     for (const feature of layers?.regions.features ?? []) {
@@ -329,6 +432,37 @@ function BaseMap() {
   const handleClick = useCallback(
     (event: MapLayerMouseEvent) => {
       const regionId = event.features?.[0]?.properties?.regionId as string | undefined
+
+      // Armed by the route planner: the click assigns a role instead of moving
+      // the heatmap, and a click on the sea disarms rather than committing.
+      if (picking) {
+        if (!regionId) {
+          setPicking(null)
+          return
+        }
+        if (picking === 'player') {
+          setPlayerId(regionId)
+          setPicking(null)
+          return
+        }
+        if (picking === 'home') {
+          setRequestedHomeId(regionId)
+          writeHomeToCookie(regionId)
+          setPicking(null)
+          return
+        }
+        if (caseIds.includes(regionId)) {
+          setCaseIds(caseIds.filter((id) => id !== regionId))
+          return
+        }
+        if (caseIds.length >= MAX_CASES) return
+        const nextCases = [...caseIds, regionId]
+        setCaseIds(nextCases)
+        // Nothing left to pick, so stop swallowing clicks.
+        if (nextCases.length >= MAX_CASES) setPicking(null)
+        return
+      }
+
       if (!regionId) {
         setRequestedRegionId(null)
         setTappedTargetId(null)
@@ -348,7 +482,7 @@ function BaseMap() {
       setRequestedRegionId(regionId)
       writeRegionToUrl(regionId)
     },
-    [regionNameById, canHover, selectedRegionId, tappedTargetId],
+    [regionNameById, canHover, selectedRegionId, tappedTargetId, picking, caseIds],
   )
 
   const handleHover = useCallback(
@@ -357,6 +491,37 @@ function BaseMap() {
       setHoveredRegionId((event.features?.[0]?.properties?.regionId as string | undefined) ?? null)
     },
     [canHover],
+  )
+
+  const handleClearPlayer = useCallback(() => {
+    setPlayerId(null)
+    setPicking((mode) => (mode === 'player' ? null : mode))
+  }, [])
+
+  const handleClearHome = useCallback(() => {
+    setRequestedHomeId(null)
+    writeHomeToCookie(null)
+    setPicking((mode) => (mode === 'home' ? null : mode))
+  }, [])
+
+  const handleClearCases = useCallback(() => {
+    setCaseIds([])
+    setPicking((mode) => (mode === 'case' ? null : mode))
+  }, [])
+
+  const handleRemoveCase = useCallback((regionId: string) => {
+    setCaseIds((previous) => previous.filter((id) => id !== regionId))
+  }, [])
+
+  const handlePlanRoute = useCallback(() => {
+    if (!playerId || caseIds.length === 0) return
+    setPicking(null)
+    setPlan({ playerId, homeId, caseIds, route: planRoute(playerId, homeId, caseIds, adjacency) })
+  }, [playerId, homeId, caseIds, adjacency])
+
+  const regionName = useCallback(
+    (regionId: string) => regionNameById.get(regionId) ?? '?',
+    [regionNameById],
   )
 
   // Whichever way the destination was picked, the rest of the map reads it here.
@@ -441,7 +606,9 @@ function BaseMap() {
     return map
   }, [layers])
 
-  // At most two features, so re-uploading it on every hover is cheap.
+  // At most nine features -- start, target, home, position and five crates --
+  // so re-uploading it on every hover is cheap. Pushed least to most telling,
+  // because one region can hold several roles and the last drawn outline wins.
   const highlightData = useMemo<FeatureCollection>(() => {
     const features = []
     const start = selectedRegionId ? regionFeatureById.get(selectedRegionId) : undefined
@@ -451,8 +618,16 @@ function BaseMap() {
         : undefined
     if (start) features.push({ ...start, properties: { role: 'start' } })
     if (target) features.push({ ...target, properties: { role: 'target' } })
+    const home = homeId ? regionFeatureById.get(homeId) : undefined
+    if (home) features.push({ ...home, properties: { role: 'home' } })
+    const player = playerId ? regionFeatureById.get(playerId) : undefined
+    if (player) features.push({ ...player, properties: { role: 'player' } })
+    for (const caseId of caseIds) {
+      const crate = regionFeatureById.get(caseId)
+      if (crate) features.push({ ...crate, properties: { role: 'case' } })
+    }
     return { type: 'FeatureCollection', features }
-  }, [selectedRegionId, targetRegionId, regionFeatureById])
+  }, [selectedRegionId, targetRegionId, regionFeatureById, homeId, playerId, caseIds])
 
   const hoverPathLinks = useMemo<FeatureCollection>(() => {
     const features = []
@@ -469,6 +644,74 @@ function BaseMap() {
     return { type: 'FeatureCollection', features }
   }, [hoverPath, positionById])
 
+  // Every walked leg drawn region by region, with the free trips home as one
+  // straight dashed jump: no regions are crossed on the way, so drawing a path
+  // there would claim a cost the trip does not have.
+  const routeLinks = useMemo<FeatureCollection>(() => {
+    const features = []
+    if (route && playerId) {
+      let position = playerId
+      for (const step of route.steps) {
+        if (step.viaHome && homeId) {
+          const from = positionById.get(position)
+          const to = positionById.get(homeId)
+          if (from && to) {
+            features.push({
+              type: 'Feature' as const,
+              properties: { kind: 'home' },
+              geometry: { type: 'LineString' as const, coordinates: [from, to] },
+            })
+          }
+        }
+        for (let i = 0; i < step.path.length - 1; i++) {
+          const from = positionById.get(step.path[i])
+          const to = positionById.get(step.path[i + 1])
+          if (!from || !to) continue
+          features.push({
+            type: 'Feature' as const,
+            properties: { kind: 'walk' },
+            geometry: { type: 'LineString' as const, coordinates: [from, to] },
+          })
+        }
+        position = step.caseId
+      }
+    }
+    return { type: 'FeatureCollection', features }
+  }, [route, playerId, homeId, positionById])
+
+  // Pins for home, the player and every crate, readable at any zoom unlike the
+  // region outlines. Once a route exists each crate wears the order it is
+  // collected in. One pin per region, since a crate can sit on the region you
+  // are standing on and you can be standing at home: whichever role says the
+  // most about the region wins, and the panel spells the rest out.
+  //
+  // 'H' and 'P' rather than a house or a pin glyph: the label stack is Noto
+  // Sans and a glyph it is missing renders as nothing at all.
+  const routeMarkers = useMemo<FeatureCollection>(() => {
+    const orderByCase = new globalThis.Map<string, number>()
+    route?.steps.forEach((step, index) => orderByCase.set(step.caseId, index + 1))
+
+    const pins = new globalThis.Map<string, { role: string; label: string }>()
+    if (homeId) pins.set(homeId, { role: 'home', label: 'H' })
+    if (playerId) pins.set(playerId, { role: 'player', label: 'P' })
+    for (const caseId of caseIds) {
+      const order = orderByCase.get(caseId)
+      pins.set(caseId, { role: 'case', label: order ? String(order) : '' })
+    }
+
+    const features = []
+    for (const [regionId, properties] of pins) {
+      const position = positionById.get(regionId)
+      if (!position) continue
+      features.push({
+        type: 'Feature' as const,
+        properties,
+        geometry: { type: 'Point' as const, coordinates: position },
+      })
+    }
+    return { type: 'FeatureCollection', features }
+  }, [route, homeId, playerId, caseIds, positionById])
+
   return (
     <>
       <Map
@@ -479,6 +722,7 @@ function BaseMap() {
         }}
         style={{ width: '100%', height: '100%' }}
         mapStyle={BASE_STYLE}
+        cursor={picking ? 'crosshair' : undefined}
         onLoad={handleLoad}
         interactiveLayerIds={layers ? ['regions-fill'] : []}
         onClick={handleClick}
@@ -583,6 +827,41 @@ function BaseMap() {
                 }}
               />
             </Source>
+
+            {/* The planned trip, declared last so it draws over the labels. */}
+            <Source id="route" type="geojson" data={routeLinks}>
+              <Layer
+                id="route-glow"
+                type="line"
+                filter={WALKED_LEG_FILTER}
+                layout={ROUTE_LINE_LAYOUT}
+                paint={ROUTE_GLOW_PAINT}
+              />
+              <Layer
+                id="route-core"
+                type="line"
+                filter={WALKED_LEG_FILTER}
+                layout={ROUTE_LINE_LAYOUT}
+                paint={ROUTE_CORE_PAINT}
+              />
+              <Layer
+                id="route-home-leg"
+                type="line"
+                filter={HOME_LEG_FILTER}
+                layout={ROUTE_LINE_LAYOUT}
+                paint={ROUTE_HOME_LEG_PAINT}
+              />
+            </Source>
+
+            <Source id="route-markers" type="geojson" data={routeMarkers}>
+              <Layer id="route-markers-pin" type="circle" paint={ROUTE_MARKER_PAINT} />
+              <Layer
+                id="route-markers-label"
+                type="symbol"
+                layout={ROUTE_MARKER_LAYOUT}
+                paint={ROUTE_MARKER_LABEL_PAINT}
+              />
+            </Source>
           </>
         )}
       </Map>
@@ -592,6 +871,23 @@ function BaseMap() {
           regionName={regionNameById.get(selectedRegionId) ?? '?'}
           distances={heatmap.distances}
           totalRegions={layers.regions.features.length}
+        />
+      )}
+
+      {layers && (
+        <RoutePlanner
+          playerId={playerId}
+          homeId={homeId}
+          caseIds={caseIds}
+          regionName={regionName}
+          picking={picking}
+          onPick={setPicking}
+          onClearPlayer={handleClearPlayer}
+          onClearHome={handleClearHome}
+          onRemoveCase={handleRemoveCase}
+          onClearCases={handleClearCases}
+          onPlan={handlePlanRoute}
+          route={route}
         />
       )}
 
